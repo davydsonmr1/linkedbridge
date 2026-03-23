@@ -14,9 +14,16 @@
     "prisma:generate": "prisma generate",
     "prisma:migrate": "prisma migrate dev",
     "prisma:studio": "prisma studio",
-    "lint": "tsc --noEmit"
+    "db:migrate": "prisma migrate deploy",
+    "db:reset": "prisma migrate reset",
+    "lint": "tsc --noEmit",
+    "test": "npx tsx --test ./src/infra/crypto/aes-gcm.service.spec.ts"
   },
   "dependencies": {
+    "@fastify/cookie": "^11.0.2",
+    "@fastify/cors": "^11.2.0",
+    "@fastify/helmet": "^13.0.2",
+    "@fastify/rate-limit": "^10.3.0",
     "@prisma/client": "^6.5.0",
     "dotenv": "^16.4.7",
     "fastify": "^5.3.2",
