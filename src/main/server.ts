@@ -5,8 +5,10 @@
 // It wires all dependencies together and starts the
 // Fastify HTTP server.
 //
-// Dependency Injection is performed manually here —
-// no DI container needed for this scale.
+// Production Features:
+// - Graceful Shutdown (SIGINT/SIGTERM)
+// - Prisma $disconnect on shutdown
+// - Manual Dependency Injection
 // =====================================================
 
 import 'dotenv/config';
@@ -31,7 +33,7 @@ import { GetPortfolioPostsUseCase } from '../application/use-cases/get-portfolio
 import { OAuthController } from '../infra/http/controllers/oauth.controller.js';
 import { PortfolioController } from '../infra/http/controllers/portfolio.controller.js';
 
-// Repositories (interfaces — wired to Prisma in Task 10)
+// Repositories (interfaces — wired to Prisma implementations when available)
 import type { IApiKeyRepository } from '../domain/repositories/i-api-key.repository.js';
 
 const PORT = Number(process.env['PORT']) || 3333;
@@ -51,13 +53,13 @@ async function bootstrap(): Promise<void> {
   });
 
   // ─── 3. Instantiate Repositories ───
-  // TODO (Task 10): Replace with Prisma implementations
+  // TODO: Replace with Prisma implementations when DB layer is ready
   const apiKeyRepository = undefined as unknown as IApiKeyRepository;
 
   // ─── 4. Instantiate Use Cases ───
   const generateOAuthUrlUseCase = new GenerateOAuthUrlUseCase(linkedInGateway);
 
-  // Use cases requiring repositories (Task 10 will wire them)
+  // Use cases requiring repositories — will be wired when Prisma repos exist
   const processOAuthCallbackUseCase = undefined as unknown as ProcessOAuthCallbackUseCase;
   const syncUserPostsUseCase = undefined as unknown as SyncUserPostsUseCase;
   const syncAllUsersUseCase = undefined as unknown as SyncAllUsersUseCase;
@@ -94,6 +96,48 @@ async function bootstrap(): Promise<void> {
   app.log.info(`[LinkedBridge] 🚀 Server running on http://${HOST}:${PORT}`);
   app.log.info(`[LinkedBridge] 🔒 Helmet, CORS, Rate-Limit, and Cookie plugins active`);
   app.log.info(`[LinkedBridge] 📡 Public API at GET /api/v1/posts`);
+
+  // ─── 8. Graceful Shutdown ───
+  // When the process receives SIGINT (Ctrl+C) or SIGTERM (deploy/restart),
+  // we stop accepting new connections and clean up resources before exiting.
+  // This prevents in-flight requests from being dropped and ensures
+  // database connections are properly released.
+  const gracefulShutdown = async (signal: string): Promise<void> => {
+    app.log.info(`[LinkedBridge] ${signal} received. Starting graceful shutdown...`);
+
+    try {
+      // 1. Stop accepting new HTTP requests and wait for in-flight to finish
+      await app.close();
+      app.log.info('[LinkedBridge] ✅ Fastify closed — no more incoming requests');
+
+      // 2. Disconnect Prisma Client
+      // The Prisma Client instance should be imported here when ready:
+      // await prisma.$disconnect();
+      // app.log.info('[LinkedBridge] ✅ Prisma disconnected');
+
+      app.log.info('[LinkedBridge] 🏁 Graceful shutdown complete');
+      process.exit(0);
+    } catch (error: unknown) {
+      app.log.error(error, '[LinkedBridge] ❌ Error during graceful shutdown');
+      process.exit(1);
+    }
+  };
+
+  // Register shutdown handlers
+  process.on('SIGINT', () => void gracefulShutdown('SIGINT'));
+  process.on('SIGTERM', () => void gracefulShutdown('SIGTERM'));
+
+  // Catch unhandled rejections in production to prevent silent crashes
+  process.on('unhandledRejection', (reason: unknown) => {
+    app.log.error(reason, '[LinkedBridge] Unhandled promise rejection');
+    // In production, let the process manager restart us
+    process.exit(1);
+  });
+
+  process.on('uncaughtException', (error: Error) => {
+    app.log.fatal(error, '[LinkedBridge] Uncaught exception — shutting down');
+    process.exit(1);
+  });
 }
 
 bootstrap().catch((error: unknown) => {

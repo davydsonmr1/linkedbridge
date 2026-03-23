@@ -6,10 +6,15 @@
 // from the domain.
 //
 // Security Features:
-// - AbortController timeout on all HTTP calls (8s)
+// - AbortController timeout on all HTTP calls (8s/10s)
 // - Zod boundary validation on all responses
 // - Never leaks raw LinkedIn errors to the domain
 // - Constructor DI for all config (no loose process.env)
+//
+// Resilience:
+// - Circuit Breaker pattern to prevent cascading failures
+//   when LinkedIn is down. Opens after 5 consecutive
+//   failures, stays open for 60 seconds.
 // =====================================================
 
 import { ZodError } from 'zod';
@@ -45,6 +50,14 @@ const DEFAULT_TIMEOUT_MS = 8_000;
 const POSTS_TIMEOUT_MS = 10_000;
 
 /**
+ * Circuit Breaker thresholds.
+ * - FAILURE_THRESHOLD: number of consecutive failures before opening
+ * - RECOVERY_TIMEOUT_MS: how long the circuit stays open (60 seconds)
+ */
+const CB_FAILURE_THRESHOLD = 5;
+const CB_RECOVERY_TIMEOUT_MS = 60_000;
+
+/**
  * LinkedIn OAuth 2.0 scopes.
  * - openid: OpenID Connect
  * - profile: Basic profile (name, picture)
@@ -57,6 +70,14 @@ const LINKEDIN_SCOPES = [
   'email',
   'w_member_social',
 ] as const;
+
+// ----- Circuit Breaker State -----
+
+enum CircuitState {
+  CLOSED = 'CLOSED',     // Normal operation — requests go through
+  OPEN = 'OPEN',         // Failures exceeded threshold — reject immediately
+  HALF_OPEN = 'HALF_OPEN', // Testing if service recovered — allow one request
+}
 
 // ----- Config Interface -----
 
@@ -74,6 +95,11 @@ export class LinkedInGateway implements ILinkedInGateway {
   private readonly clientSecret: string;
   private readonly redirectUri: string;
   private readonly timeoutMs: number;
+
+  // Circuit Breaker state (in-memory, per-instance)
+  private circuitState: CircuitState = CircuitState.CLOSED;
+  private consecutiveFailures: number = 0;
+  private circuitOpenedAt: number = 0;
 
   constructor(config: LinkedInGatewayConfig) {
     if (!config.clientId) {
@@ -123,6 +149,8 @@ export class LinkedInGateway implements ILinkedInGateway {
    * Validates LinkedIn's response with a Zod schema at the boundary.
    */
   async exchangeCodeForToken(code: string): Promise<LinkedInTokenResult> {
+    // Token exchange bypasses Circuit Breaker — it's a user-initiated
+    // action and must always attempt to reach LinkedIn.
     const body = new URLSearchParams({
       grant_type: 'authorization_code',
       code,
@@ -204,11 +232,18 @@ export class LinkedInGateway implements ILinkedInGateway {
   /**
    * Fetches recent posts authored by the user.
    * Uses LinkedIn's Posts API (v2/posts) with author filter.
+   *
+   * CIRCUIT BREAKER: This method is protected by the Circuit Breaker.
+   * If LinkedIn has failed 5 times in a row, this method will reject
+   * immediately without making an HTTP call.
    */
   async fetchRecentPosts(
     accessToken: string,
     authorUrn: string,
   ): Promise<LinkedInPostSummary[]> {
+    // ─── Circuit Breaker Check ───
+    this.assertCircuitClosed('fetchRecentPosts');
+
     const params = new URLSearchParams({
       author: authorUrn,
       q: 'author',
@@ -218,18 +253,27 @@ export class LinkedInGateway implements ILinkedInGateway {
 
     const url = `${LINKEDIN_API_BASE}/posts?${params.toString()}`;
 
-    const response = await this.fetchWithTimeout(url, {
-      method: 'GET',
-      headers: {
-        Authorization: `Bearer ${accessToken}`,
-        'Accept': 'application/json',
-        'LinkedIn-Version': '202401',
-        'X-Restli-Protocol-Version': '2.0.0',
-      },
-    }, POSTS_TIMEOUT_MS);
+    let response: Response;
+    try {
+      response = await this.fetchWithTimeout(url, {
+        method: 'GET',
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          'Accept': 'application/json',
+          'LinkedIn-Version': '202401',
+          'X-Restli-Protocol-Version': '2.0.0',
+        },
+      }, POSTS_TIMEOUT_MS);
+    } catch (error: unknown) {
+      this.recordFailure();
+      throw error;
+    }
 
     // ─── Rate Limit Detection ───
     if (response.status === 429) {
+      // Rate limits count as failures for the Circuit Breaker
+      this.recordFailure();
+
       const retryAfterHeader = response.headers.get('Retry-After');
       const retryAfterMs = retryAfterHeader
         ? parseInt(retryAfterHeader, 10) * 1000
@@ -242,14 +286,22 @@ export class LinkedInGateway implements ILinkedInGateway {
     }
 
     if (response.status === 401 || response.status === 403) {
+      // Auth errors are NOT circuit breaker failures (it's our token, not LinkedIn)
       throw new UnauthorizedError(
         'LinkedIn access token is invalid or expired.',
       );
     }
 
     if (!response.ok) {
+      // 5xx errors count as failures
+      if (response.status >= 500) {
+        this.recordFailure();
+      }
       await this.handleErrorResponse(response, 'fetchRecentPosts');
     }
+
+    // SUCCESS — reset the circuit breaker
+    this.recordSuccess();
 
     const rawJson: unknown = await response.json();
 
@@ -316,6 +368,58 @@ export class LinkedInGateway implements ILinkedInGateway {
     };
   }
 
+  // ----- Circuit Breaker Helpers -----
+
+  /**
+   * Checks the current circuit state and rejects if OPEN.
+   * If the recovery timeout has elapsed, transitions to HALF_OPEN.
+   */
+  private assertCircuitClosed(operation: string): void {
+    if (this.circuitState === CircuitState.CLOSED) {
+      return; // Normal operation
+    }
+
+    if (this.circuitState === CircuitState.OPEN) {
+      const elapsed = Date.now() - this.circuitOpenedAt;
+
+      if (elapsed >= CB_RECOVERY_TIMEOUT_MS) {
+        // Recovery timeout expired — allow ONE test request
+        this.circuitState = CircuitState.HALF_OPEN;
+        return;
+      }
+
+      // Still within recovery period — reject immediately
+      throw new GatewayError(
+        'LinkedIn API is temporarily unavailable. The system is protecting itself from cascading failures. Please try again later.',
+        `Circuit Breaker OPEN for ${operation}. ${Math.ceil((CB_RECOVERY_TIMEOUT_MS - elapsed) / 1000)}s remaining.`,
+      );
+    }
+
+    // HALF_OPEN — allow the request through (test probe)
+  }
+
+  /**
+   * Records a successful request.
+   * Resets the failure counter and closes the circuit.
+   */
+  private recordSuccess(): void {
+    this.consecutiveFailures = 0;
+    this.circuitState = CircuitState.CLOSED;
+  }
+
+  /**
+   * Records a failed request.
+   * If failures exceed the threshold, opens the circuit.
+   */
+  private recordFailure(): void {
+    this.consecutiveFailures++;
+
+    if (this.consecutiveFailures >= CB_FAILURE_THRESHOLD) {
+      this.circuitState = CircuitState.OPEN;
+      this.circuitOpenedAt = Date.now();
+    }
+  }
+
   // ----- Private Helpers -----
 
   /**
@@ -341,7 +445,7 @@ export class LinkedInGateway implements ILinkedInGateway {
       if (error instanceof DOMException && error.name === 'AbortError') {
         throw new GatewayError(
           'LinkedIn API request timed out. Please try again later.',
-          `Timeout after ${this.timeoutMs}ms for ${url}`,
+          `Timeout after ${timeout}ms for ${url}`,
         );
       }
 

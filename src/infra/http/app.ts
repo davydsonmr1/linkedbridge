@@ -8,7 +8,11 @@
 // Security Plugins:
 // - @fastify/helmet: HTTP security headers (HSTS, CSP, etc.)
 // - @fastify/cookie: HttpOnly cookie support (OAuth state)
+// - @fastify/cors: Cross-Origin Resource Sharing
 // - @fastify/rate-limit: Brute-force / DDoS protection
+//
+// Observability:
+// - Pino logger with `redact` for PII/token masking
 // =====================================================
 
 import Fastify, { type FastifyInstance } from 'fastify';
@@ -19,6 +23,25 @@ import fastifyRateLimit from '@fastify/rate-limit';
 
 import { globalErrorHandler } from './error-handler.js';
 
+// ─── PII / Token fields to NEVER log ───
+// Pino's `redact` option replaces the value of matching
+// paths with "[REDACTED]" before writing to the log stream.
+// This protects against accidental PII leakage in production.
+const REDACTED_PATHS = [
+  'req.headers.authorization',
+  'req.headers["x-api-key"]',
+  'req.headers.cookie',
+  'accessToken',
+  'refreshToken',
+  'encryptedAccessToken',
+  'email',
+  'password',
+  'secret',
+  'token',
+  'iv',
+  'authTag',
+];
+
 export async function buildApp(): Promise<FastifyInstance> {
   const isProduction = process.env['NODE_ENV'] === 'production';
 
@@ -26,6 +49,14 @@ export async function buildApp(): Promise<FastifyInstance> {
     logger: {
       level: isProduction ? 'info' : 'debug',
       ...(!isProduction && { transport: { target: 'pino-pretty' } }),
+      // INFOSEC: Redact PII and tokens from ALL log output.
+      // This applies to the entire log pipeline — any object
+      // logged via request.log, app.log, or Pino directly
+      // will have matching keys replaced with "[REDACTED]".
+      redact: {
+        paths: REDACTED_PATHS,
+        censor: '[REDACTED]',
+      },
     },
     disableRequestLogging: false,
   });
