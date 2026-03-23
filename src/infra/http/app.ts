@@ -13,6 +13,7 @@
 
 import Fastify, { type FastifyInstance } from 'fastify';
 import fastifyCookie from '@fastify/cookie';
+import fastifyCors from '@fastify/cors';
 import fastifyHelmet from '@fastify/helmet';
 import fastifyRateLimit from '@fastify/rate-limit';
 
@@ -59,6 +60,17 @@ export async function buildApp(): Promise<FastifyInstance> {
   const cookieSecret = process.env['COOKIE_SECRET'];
   await app.register(fastifyCookie, {
     ...(cookieSecret ? { secret: cookieSecret } : {}),
+  });
+
+  // ─── CORS (Public API) ───
+  // Allow any origin because portfolio sites are on diverse domains.
+  // Restrict methods to GET and OPTIONS only (read-only public API).
+  await app.register(fastifyCors, {
+    origin: true,
+    methods: ['GET', 'OPTIONS'],
+    allowedHeaders: ['X-API-KEY', 'Content-Type', 'Accept'],
+    exposedHeaders: ['X-RateLimit-Limit', 'X-RateLimit-Remaining', 'X-RateLimit-Reset'],
+    maxAge: 86400, // Preflight cache: 24 hours
   });
 
   // ─── Rate Limiting (DDoS / Brute-Force Protection) ───
