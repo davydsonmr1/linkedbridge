@@ -15,13 +15,13 @@ export function registerOAuthRoutes(
 ): void {
   // Initiate LinkedIn OAuth flow
   app.get(
-    '/auth/linkedin',
+    '/api/auth/linkedin',
     controller.login.bind(controller),
   );
 
   // Handle LinkedIn OAuth callback
   app.get(
-    '/auth/linkedin/callback',
+    '/api/auth/linkedin/callback',
     controller.callback.bind(controller),
   );
 }
