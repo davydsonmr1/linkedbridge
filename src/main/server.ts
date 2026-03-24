@@ -1,5 +1,5 @@
 // =====================================================
-// LinkedBridge — Server Bootstrap
+// LinkedBridge — Server Bootstrap (Composition Root)
 // =====================================================
 // This is the Composition Root (main/server.ts).
 // It wires all dependencies together and starts the
@@ -8,7 +8,7 @@
 // Production Features:
 // - Graceful Shutdown (SIGINT/SIGTERM)
 // - Prisma $disconnect on shutdown
-// - Manual Dependency Injection
+// - Manual Dependency Injection (no DI container)
 // =====================================================
 
 import 'dotenv/config';
@@ -18,9 +18,20 @@ import { registerOAuthRoutes } from '../infra/http/routes/oauth.routes.js';
 import { registerCronRoutes } from '../infra/http/routes/cron.routes.js';
 import { registerPublicRoutes } from '../infra/http/routes/public.routes.js';
 
-// Infrastructure
+// Infrastructure — Database
+import { prisma } from '../infra/database/prisma/prisma-client.js';
+
+// Infrastructure — Crypto
 import { AesGcmCryptoService } from '../infra/crypto/aes-gcm.service.js';
+
+// Infrastructure — Gateways
 import { LinkedInGateway } from '../infra/gateways/linkedin/linkedin.gateway.js';
+
+// Infrastructure — Repositories (Prisma implementations)
+import { PrismaUserRepository } from '../infra/database/prisma/repositories/prisma-user.repository.js';
+import { PrismaOAuthCredentialRepository } from '../infra/database/prisma/repositories/prisma-oauth-credential.repository.js';
+import { PrismaApiKeyRepository } from '../infra/database/prisma/repositories/prisma-api-key.repository.js';
+import { PrismaPostCacheRepository } from '../infra/database/prisma/repositories/prisma-post-cache.repository.js';
 
 // Use Cases
 import { GenerateOAuthUrlUseCase } from '../application/use-cases/generate-oauth-url.usecase.js';
@@ -32,9 +43,6 @@ import { GetPortfolioPostsUseCase } from '../application/use-cases/get-portfolio
 // Controllers
 import { OAuthController } from '../infra/http/controllers/oauth.controller.js';
 import { PortfolioController } from '../infra/http/controllers/portfolio.controller.js';
-
-// Repositories (interfaces — wired to Prisma implementations when available)
-import type { IApiKeyRepository } from '../domain/repositories/i-api-key.repository.js';
 
 const PORT = Number(process.env['PORT']) || 3333;
 const HOST = process.env['HOST'] || '0.0.0.0';
@@ -52,18 +60,37 @@ async function bootstrap(): Promise<void> {
     redirectUri: process.env['LINKEDIN_REDIRECT_URI'] ?? '',
   });
 
-  // ─── 3. Instantiate Repositories ───
-  // TODO: Replace with Prisma implementations when DB layer is ready
-  const apiKeyRepository = undefined as unknown as IApiKeyRepository;
+  // ─── 3. Instantiate Repositories (Prisma implementations) ───
+  const userRepository = new PrismaUserRepository(prisma);
+  const oauthCredentialRepository = new PrismaOAuthCredentialRepository(prisma);
+  const apiKeyRepository = new PrismaApiKeyRepository(prisma);
+  const postCacheRepository = new PrismaPostCacheRepository(prisma);
 
   // ─── 4. Instantiate Use Cases ───
   const generateOAuthUrlUseCase = new GenerateOAuthUrlUseCase(linkedInGateway);
 
-  // Use cases requiring repositories — will be wired when Prisma repos exist
-  const processOAuthCallbackUseCase = undefined as unknown as ProcessOAuthCallbackUseCase;
-  const syncUserPostsUseCase = undefined as unknown as SyncUserPostsUseCase;
-  const syncAllUsersUseCase = undefined as unknown as SyncAllUsersUseCase;
-  const getPortfolioPostsUseCase = undefined as unknown as GetPortfolioPostsUseCase;
+  const processOAuthCallbackUseCase = new ProcessOAuthCallbackUseCase(
+    linkedInGateway,
+    cryptoService,
+    userRepository,
+    oauthCredentialRepository,
+  );
+
+  const syncUserPostsUseCase = new SyncUserPostsUseCase(
+    userRepository,
+    oauthCredentialRepository,
+    postCacheRepository,
+    linkedInGateway,
+    cryptoService,
+  );
+
+  const syncAllUsersUseCase = new SyncAllUsersUseCase(
+    userRepository,
+    oauthCredentialRepository,
+    syncUserPostsUseCase,
+  );
+
+  const getPortfolioPostsUseCase = new GetPortfolioPostsUseCase(postCacheRepository);
 
   // ─── 5. Instantiate Controllers ───
   const oauthController = new OAuthController(
@@ -89,10 +116,6 @@ async function bootstrap(): Promise<void> {
   // ─── 7. Start the Server ───
   await app.listen({ port: PORT, host: HOST });
 
-  // Suppress unused variable warnings
-  void cryptoService;
-  void syncUserPostsUseCase;
-
   app.log.info(`[LinkedBridge] 🚀 Server running on http://${HOST}:${PORT}`);
   app.log.info(`[LinkedBridge] 🔒 Helmet, CORS, Rate-Limit, and Cookie plugins active`);
   app.log.info(`[LinkedBridge] 📡 Public API at GET /api/v1/posts`);
@@ -110,10 +133,9 @@ async function bootstrap(): Promise<void> {
       await app.close();
       app.log.info('[LinkedBridge] ✅ Fastify closed — no more incoming requests');
 
-      // 2. Disconnect Prisma Client
-      // The Prisma Client instance should be imported here when ready:
-      // await prisma.$disconnect();
-      // app.log.info('[LinkedBridge] ✅ Prisma disconnected');
+      // 2. Disconnect Prisma Client — release all DB connections
+      await prisma.$disconnect();
+      app.log.info('[LinkedBridge] ✅ Prisma disconnected');
 
       app.log.info('[LinkedBridge] 🏁 Graceful shutdown complete');
       process.exit(0);
