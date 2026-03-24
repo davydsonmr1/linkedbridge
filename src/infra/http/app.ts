@@ -7,9 +7,10 @@
 //
 // Security Plugins:
 // - @fastify/helmet: HTTP security headers (HSTS, CSP, etc.)
-// - @fastify/cookie: HttpOnly cookie support (OAuth state)
+// - @fastify/cookie: HttpOnly cookie support (OAuth state + JWT session)
 // - @fastify/cors: Cross-Origin Resource Sharing
 // - @fastify/rate-limit: Brute-force / DDoS protection
+// - @fastify/jwt: JWT signing and verification (SaaS sessions)
 //
 // Observability:
 // - Pino logger with `redact` for PII/token masking
@@ -19,6 +20,7 @@ import Fastify, { type FastifyInstance } from 'fastify';
 import fastifyCookie from '@fastify/cookie';
 import fastifyCors from '@fastify/cors';
 import fastifyHelmet from '@fastify/helmet';
+import fastifyJwt from '@fastify/jwt';
 import fastifyRateLimit from '@fastify/rate-limit';
 
 import { globalErrorHandler } from './error-handler.js';
@@ -41,6 +43,15 @@ const REDACTED_PATHS = [
   'iv',
   'authTag',
 ];
+
+/**
+ * Name of the HttpOnly cookie that stores the SaaS session JWT.
+ * The `__Host-` prefix enforces:
+ * - Must be Secure (HTTPS only)
+ * - Must not have a Domain attribute
+ * - Path must be /
+ */
+const SESSION_COOKIE_NAME = '__Host-saas_session';
 
 export async function buildApp(): Promise<FastifyInstance> {
   const isProduction = process.env['NODE_ENV'] === 'production';
@@ -87,18 +98,40 @@ export async function buildApp(): Promise<FastifyInstance> {
     },
   });
 
-  // ─── Cookies (OAuth State / CSRF) ───
+  // ─── Cookies (OAuth State / CSRF + JWT Session) ───
   const cookieSecret = process.env['COOKIE_SECRET'];
   await app.register(fastifyCookie, {
     ...(cookieSecret ? { secret: cookieSecret } : {}),
   });
 
-  // ─── CORS (Public API) ───
-  // Allow any origin because portfolio sites are on diverse domains.
-  // Restrict methods to GET and OPTIONS only (read-only public API).
+  // ─── JWT (SaaS Session Authentication) ───
+  // Used to sign and verify JWTs stored in the `__Host-saas_session` cookie.
+  // The @fastify/jwt plugin decorates `app.jwt`, `request.jwtVerify()`,
+  // and `reply.jwtSign()` onto Fastify's instance.
+  const jwtSecret = process.env['JWT_SECRET'];
+  if (!jwtSecret) {
+    throw new Error('[CRITICAL] JWT_SECRET is not set. Cannot initialize JWT authentication.');
+  }
+
+  await app.register(fastifyJwt, {
+    secret: jwtSecret,
+    cookie: {
+      cookieName: SESSION_COOKIE_NAME,
+      signed: false,
+    },
+    sign: {
+      expiresIn: '7d',
+    },
+  });
+
+  // ─── CORS (Public API + SaaS Dashboard) ───
+  // Allow any origin for portfolio API routes (diverse domains).
+  // Dashboard routes share the same origin as the frontend.
+  const frontendUrl = process.env['FRONTEND_URL'] ?? 'http://localhost:5173';
   await app.register(fastifyCors, {
-    origin: true,
-    methods: ['GET', 'OPTIONS'],
+    origin: [frontendUrl, true],
+    credentials: true,
+    methods: ['GET', 'POST', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['X-API-KEY', 'Content-Type', 'Accept'],
     exposedHeaders: ['X-RateLimit-Limit', 'X-RateLimit-Remaining', 'X-RateLimit-Reset'],
     maxAge: 86400, // Preflight cache: 24 hours

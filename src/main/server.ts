@@ -17,12 +17,14 @@ import { buildApp } from '../infra/http/app.js';
 import { registerOAuthRoutes } from '../infra/http/routes/oauth.routes.js';
 import { registerCronRoutes } from '../infra/http/routes/cron.routes.js';
 import { registerPublicRoutes } from '../infra/http/routes/public.routes.js';
+import { registerSaaSRoutes } from '../infra/http/routes/saas.routes.js';
 
 // Infrastructure — Database
 import { prisma } from '../infra/database/prisma/prisma-client.js';
 
 // Infrastructure — Crypto
 import { AesGcmCryptoService } from '../infra/crypto/aes-gcm.service.js';
+import { ApiKeyService } from '../infra/crypto/api-key.service.js';
 
 // Infrastructure — Gateways
 import { LinkedInGateway } from '../infra/gateways/linkedin/linkedin.gateway.js';
@@ -39,20 +41,25 @@ import { ProcessOAuthCallbackUseCase } from '../application/use-cases/process-oa
 import { SyncUserPostsUseCase } from '../application/use-cases/sync-user-posts.usecase.js';
 import { SyncAllUsersUseCase } from '../application/use-cases/sync-all-users.usecase.js';
 import { GetPortfolioPostsUseCase } from '../application/use-cases/get-portfolio-posts.usecase.js';
+import { CreateApiKeyUseCase } from '../application/use-cases/create-api-key.usecase.js';
+import { ListApiKeysUseCase } from '../application/use-cases/list-api-keys.usecase.js';
+import { RevokeApiKeyUseCase } from '../application/use-cases/revoke-api-key.usecase.js';
 
 // Controllers
 import { OAuthController } from '../infra/http/controllers/oauth.controller.js';
 import { PortfolioController } from '../infra/http/controllers/portfolio.controller.js';
+import { SaaSController } from '../infra/http/controllers/saas.controller.js';
 
 const PORT = Number(process.env['PORT']) || 3333;
 const HOST = process.env['HOST'] || '0.0.0.0';
 
 async function bootstrap(): Promise<void> {
-  // ─── 1. Build the Fastify App (with security plugins) ───
+  // ─── 1. Build the Fastify App (with security plugins + JWT) ───
   const app = await buildApp();
 
   // ─── 2. Instantiate Infrastructure Services ───
   const cryptoService = new AesGcmCryptoService();
+  const apiKeyService = new ApiKeyService();
 
   const linkedInGateway = new LinkedInGateway({
     clientId: process.env['LINKEDIN_CLIENT_ID'] ?? '',
@@ -92,6 +99,10 @@ async function bootstrap(): Promise<void> {
 
   const getPortfolioPostsUseCase = new GetPortfolioPostsUseCase(postCacheRepository);
 
+  const createApiKeyUseCase = new CreateApiKeyUseCase(apiKeyRepository, apiKeyService);
+  const listApiKeysUseCase = new ListApiKeysUseCase(apiKeyRepository);
+  const revokeApiKeyUseCase = new RevokeApiKeyUseCase(apiKeyRepository);
+
   // ─── 5. Instantiate Controllers ───
   const oauthController = new OAuthController(
     generateOAuthUrlUseCase,
@@ -100,9 +111,16 @@ async function bootstrap(): Promise<void> {
 
   const portfolioController = new PortfolioController(getPortfolioPostsUseCase);
 
+  const saasController = new SaaSController(
+    createApiKeyUseCase,
+    listApiKeysUseCase,
+    revokeApiKeyUseCase,
+  );
+
   // ─── 6. Register Routes ───
   registerOAuthRoutes(app, oauthController);
   registerPublicRoutes(app, portfolioController, apiKeyRepository);
+  registerSaaSRoutes(app, saasController);
 
   // Cron routes (protected by CRON_SECRET_KEY)
   const cronSecretKey = process.env['CRON_SECRET_KEY'];
@@ -117,8 +135,9 @@ async function bootstrap(): Promise<void> {
   await app.listen({ port: PORT, host: HOST });
 
   app.log.info(`[LinkedBridge] 🚀 Server running on http://${HOST}:${PORT}`);
-  app.log.info(`[LinkedBridge] 🔒 Helmet, CORS, Rate-Limit, and Cookie plugins active`);
+  app.log.info(`[LinkedBridge] 🔒 Helmet, CORS, Rate-Limit, Cookie, and JWT plugins active`);
   app.log.info(`[LinkedBridge] 📡 Public API at GET /api/v1/posts`);
+  app.log.info(`[LinkedBridge] 🔑 SaaS Dashboard at /api/saas/keys`);
 
   // ─── 8. Graceful Shutdown ───
   // When the process receives SIGINT (Ctrl+C) or SIGTERM (deploy/restart),
