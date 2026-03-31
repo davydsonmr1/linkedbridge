@@ -5,10 +5,11 @@
 // Protected by API Key middleware + rate limiting.
 //
 // CORS: Configured to allow any origin (portfolio sites
-// are on diverse domains) but restricts methods to GET only.
+// are on diverse domains) but restricts methods to GET/POST.
 //
-// Rate Limit: 60 req/min per API key (stricter than global)
-// to prevent resource exhaustion from a single consumer.
+// Rate Limit: 60 req/min per API key for reads (stricter
+// than global) to prevent resource exhaustion.
+// Sync endpoint: 5 req/min (heavy operation).
 // =====================================================
 
 import type { FastifyInstance } from 'fastify';
@@ -43,4 +44,27 @@ export function registerPublicRoutes(
     },
     controller.getPosts.bind(controller),
   );
+
+  // ─── Manual Sync Endpoint ───
+  // Allows API-key holders to force a re-sync of their
+  // LinkedIn posts without relying on the Cron Job.
+  app.post(
+    '/api/v1/posts/sync',
+    {
+      preHandler: [authHook],
+      config: {
+        // Stricter rate limit: sync is a heavy operation
+        // (calls LinkedIn API + upserts into DB)
+        rateLimit: {
+          max: 5,
+          timeWindow: '1 minute',
+          keyGenerator: (request) => {
+            return request.headers['x-api-key'] as string || request.ip;
+          },
+        },
+      },
+    },
+    controller.forceSync.bind(controller),
+  );
 }
+

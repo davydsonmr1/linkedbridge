@@ -43,6 +43,8 @@ export interface SyncUserPostsOutput {
   postsCount: number;
   syncedAt: Date;
   tokenRefreshed: boolean;
+  /** Present when the sync was aborted to protect existing data. */
+  warning?: string;
 }
 
 export class SyncUserPostsUseCase {
@@ -56,6 +58,10 @@ export class SyncUserPostsUseCase {
 
   /**
    * Synchronizes a user's LinkedIn posts to the local cache.
+   *
+   * **Safeguard**: If the LinkedIn gateway fails or returns an empty
+   * list, the existing cached posts are preserved intact. The operation
+   * is aborted and a warning is returned instead of throwing.
    *
    * If the token is expired and a refresh token exists, it will
    * automatically renew the access token before fetching posts.
@@ -139,7 +145,7 @@ export class SyncUserPostsUseCase {
       credential.authTag,
     );
 
-    // ─── Step 5: Fetch posts from LinkedIn ───
+    // ─── Step 5: Fetch posts from LinkedIn (with Safeguard) ───
     const authorUrn = `urn:li:person:${credential.userId}`;
 
     let posts: LinkedInPostSummary[];
@@ -148,9 +154,45 @@ export class SyncUserPostsUseCase {
         plainTextToken,
         authorUrn,
       );
+    } catch (gatewayError: unknown) {
+      // ──────────────────────────────────────────────────
+      // SAFEGUARD: Gateway failure — preserve existing data
+      // ──────────────────────────────────────────────────
+      // If the LinkedIn API call fails (network error, 5xx,
+      // rate-limit, etc.) we must NOT proceed with the
+      // delete/insert cycle. Existing cached posts remain
+      // untouched in the database.
+      const errorMessage =
+        gatewayError instanceof Error ? gatewayError.message : String(gatewayError);
+
+      return {
+        userId,
+        postsCount: 0,
+        syncedAt: new Date(),
+        tokenRefreshed,
+        warning: `Sincronização abortada — falha ao buscar posts do LinkedIn: ${errorMessage}. Os dados existentes foram preservados.`,
+      };
     } finally {
       // MEMORY ISOLATION: Destroy plaintext access token
       plainTextToken = null;
+    }
+
+    // ──────────────────────────────────────────────────
+    // SAFEGUARD: Empty response — preserve existing data
+    // ──────────────────────────────────────────────────
+    // If the LinkedIn API returns an empty array it likely
+    // means a transient issue (API hiccup, permissions
+    // change, empty page). We abort to avoid wiping valid
+    // cached posts.
+    if (!posts || posts.length === 0) {
+      return {
+        userId,
+        postsCount: 0,
+        syncedAt: new Date(),
+        tokenRefreshed,
+        warning:
+          'Sincronização abortada — o LinkedIn retornou 0 posts. Os dados existentes foram preservados.',
+      };
     }
 
     // ─── Step 6: Sanitize content (Zero Trust) ───
@@ -166,9 +208,7 @@ export class SyncUserPostsUseCase {
     }));
 
     // ─── Step 7: Upsert into the cache ───
-    if (sanitizedPosts.length > 0) {
-      await this.postCacheRepository.upsertPosts(sanitizedPosts);
-    }
+    await this.postCacheRepository.upsertPosts(sanitizedPosts);
 
     return {
       userId,

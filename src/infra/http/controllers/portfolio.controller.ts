@@ -3,16 +3,19 @@
 // =====================================================
 // HTTP adapter for the public portfolio API.
 // Serves cached LinkedIn posts to portfolio websites.
+// Also exposes a manual sync endpoint for API-key holders.
 // =====================================================
 
 import type { FastifyReply, FastifyRequest } from 'fastify';
 
 import type { GetPortfolioPostsUseCase } from '../../../application/use-cases/get-portfolio-posts.usecase.js';
+import type { SyncUserPostsUseCase } from '../../../application/use-cases/sync-user-posts.usecase.js';
 import { UnauthorizedError } from '../../../domain/errors/unauthorized.error.js';
 
 export class PortfolioController {
   constructor(
     private readonly getPortfolioPostsUseCase: GetPortfolioPostsUseCase,
+    private readonly syncUserPostsUseCase: SyncUserPostsUseCase,
   ) {}
 
   /**
@@ -43,4 +46,31 @@ export class PortfolioController {
         },
       });
   }
+
+  /**
+   * POST /api/v1/posts/sync
+   *
+   * Forces a manual synchronization of the authenticated user's
+   * LinkedIn posts into the cache. Protected by API key.
+   */
+  async forceSync(request: FastifyRequest, reply: FastifyReply): Promise<void> {
+    const userId = request.apiKeyUserId;
+
+    if (!userId) {
+      throw new UnauthorizedError('API key authentication required.');
+    }
+
+    const result = await this.syncUserPostsUseCase.execute(userId);
+
+    void reply.status(200).send({
+      message: 'Sincronização concluída.',
+      data: {
+        postsCount: result.postsCount,
+        syncedAt: result.syncedAt.toISOString(),
+        tokenRefreshed: result.tokenRefreshed,
+        ...(result.warning ? { warning: result.warning } : {}),
+      },
+    });
+  }
 }
+

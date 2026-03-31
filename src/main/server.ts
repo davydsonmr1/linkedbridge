@@ -109,7 +109,7 @@ async function bootstrap(): Promise<void> {
     processOAuthCallbackUseCase,
   );
 
-  const portfolioController = new PortfolioController(getPortfolioPostsUseCase);
+  const portfolioController = new PortfolioController(getPortfolioPostsUseCase, syncUserPostsUseCase);
 
   const saasController = new SaaSController(
     createApiKeyUseCase,
