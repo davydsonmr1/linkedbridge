@@ -20,6 +20,7 @@ export const CreateOAuthCredentialSchema = z.object({
   encryptedAccessToken: z.string().min(1, 'Encrypted access token is required'),
   iv: z.string().min(1, 'Initialization Vector (IV) is required'),
   authTag: z.string().min(1, 'Authentication Tag is required'),
+  linkedInSub: z.string().max(100).nullable().optional(),
   refreshToken: z.string().nullable().optional(),
   expiresAt: z.coerce.date().nullable().optional(),
 });

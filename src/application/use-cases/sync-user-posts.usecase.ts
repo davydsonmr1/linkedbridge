@@ -173,7 +173,20 @@ export class SyncUserPostsUseCase {
     }
 
     // ─── Step 5: Fetch posts from LinkedIn (with Safeguard) ───
-    const authorUrn = `urn:li:person:${credential.userId}`;
+    // The author URN must use the LinkedIn `sub` (provider ID),
+    // NOT the internal database UUID.
+    if (!credential.linkedInSub) {
+      return {
+        userId,
+        postsCount: 0,
+        syncedAt: new Date(),
+        tokenRefreshed,
+        warning:
+          'LinkedIn provider ID (sub) not found in credential. Please re-link your LinkedIn account to fix this.',
+      };
+    }
+
+    const authorUrn = `urn:li:person:${credential.linkedInSub}`;
 
     let posts: LinkedInPostSummary[];
     try {

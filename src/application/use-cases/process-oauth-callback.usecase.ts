@@ -96,6 +96,7 @@ export class ProcessOAuthCallbackUseCase {
       encryptedAccessToken: encrypted.encryptedText,
       iv: encrypted.iv,
       authTag: encrypted.authTag,
+      linkedInSub: profile.providerId,
       refreshToken: tokenResult.refreshToken ?? null,
       expiresAt,
     });
